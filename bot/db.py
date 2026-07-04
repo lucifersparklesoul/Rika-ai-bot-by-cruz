@@ -35,14 +35,27 @@ def init_db():
         added_at TEXT
     )
     ''')
+    # bans table includes an is_global flag for "global bans"
     cur.execute('''
     CREATE TABLE IF NOT EXISTS bans (
         user_id INTEGER PRIMARY KEY,
         reason TEXT,
-        created_at TEXT
+        created_at TEXT,
+        is_global INTEGER DEFAULT 0
     )
     ''')
     conn.commit()
+
+    # run lightweight migration: ensure the is_global column exists (for older DBs)
+    try:
+        cur.execute("PRAGMA table_info(bans)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'is_global' not in cols:
+            cur.execute('ALTER TABLE bans ADD COLUMN is_global INTEGER DEFAULT 0')
+            conn.commit()
+    except Exception:
+        pass
+
     return conn
 
 
@@ -168,10 +181,10 @@ def is_admin(user_id: int) -> bool:
 
 
 # Ban management
-def add_ban(user_id: int, reason: Optional[str] = None) -> bool:
+def add_ban(user_id: int, reason: Optional[str] = None, is_global: bool = False) -> bool:
     cur = conn.cursor()
     try:
-        cur.execute('INSERT OR REPLACE INTO bans (user_id, reason, created_at) VALUES (?, ?, ?)', (user_id, reason or '', _now_iso()))
+        cur.execute('INSERT OR REPLACE INTO bans (user_id, reason, created_at, is_global) VALUES (?, ?, ?, ?)', (user_id, reason or '', _now_iso(), 1 if is_global else 0))
         conn.commit()
         return True
     except Exception:
@@ -188,13 +201,35 @@ def remove_ban(user_id: int) -> bool:
 
 def is_banned(user_id: int) -> bool:
     cur = conn.cursor()
-    cur.execute('SELECT reason, created_at FROM bans WHERE user_id = ? LIMIT 1', (user_id,))
+    cur.execute('SELECT reason, created_at, is_global FROM bans WHERE user_id = ? LIMIT 1', (user_id,))
     row = cur.fetchone()
     return row is not None
 
 
-def list_bans() -> List[Tuple[int, str, str]]:
+def is_globally_banned(user_id: int) -> bool:
     cur = conn.cursor()
-    cur.execute('SELECT user_id, reason, created_at FROM bans')
+    cur.execute('SELECT is_global FROM bans WHERE user_id = ? LIMIT 1', (user_id,))
+    row = cur.fetchone()
+    return (row is not None) and (int(row[0]) == 1)
+
+
+def add_global_ban(user_id: int, reason: Optional[str] = None) -> bool:
+    # global ban: mark ban as global and remove admin if present
+    ok = add_ban(user_id, reason, is_global=True)
+    try:
+        remove_admin(user_id)
+    except Exception:
+        pass
+    return ok
+
+
+def remove_global_ban(user_id: int) -> bool:
+    # remove ban row entirely (global or not)
+    return remove_ban(user_id)
+
+
+def list_bans() -> List[Tuple[int, str, str, int]]:
+    cur = conn.cursor()
+    cur.execute('SELECT user_id, reason, created_at, is_global FROM bans')
     rows = cur.fetchall()
-    return [(r[0], r[1], r[2]) for r in rows]
+    return [(r[0], r[1], r[2], int(r[3] if r[3] is not None else 0)) for r in rows]
