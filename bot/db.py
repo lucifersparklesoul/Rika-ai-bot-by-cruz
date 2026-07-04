@@ -9,6 +9,7 @@ from .config import settings
 
 os.makedirs(os.path.dirname(settings.DB_PATH) or '.', exist_ok=True)
 
+
 def init_db():
     conn = sqlite3.connect(settings.DB_PATH, check_same_thread=False)
     cur = conn.cursor()
@@ -28,14 +29,31 @@ def init_db():
         value TEXT
     )
     ''')
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY,
+        added_at TEXT
+    )
+    ''')
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS bans (
+        user_id INTEGER PRIMARY KEY,
+        reason TEXT,
+        created_at TEXT
+    )
+    ''')
     conn.commit()
     return conn
 
+
 conn = init_db()
+
 
 def _now_iso():
     return datetime.utcnow().isoformat() + 'Z'
 
+
+# Messages / embeddings
 def save_message(user_id: int, role: str, content: str, embedding: Optional[List[float]] = None):
     cur = conn.cursor()
     emb_json = None
@@ -46,11 +64,13 @@ def save_message(user_id: int, role: str, content: str, embedding: Optional[List
     conn.commit()
     return cur.lastrowid
 
-def get_recent_messages(user_id: int, limit: int = 20) -> List[Tuple[int,str,str]]:
+
+def get_recent_messages(user_id: int, limit: int = 20) -> List[Tuple[int, str, str]]:
     cur = conn.cursor()
     cur.execute('SELECT id, role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?', (user_id, limit))
     rows = cur.fetchall()
     return [(r[0], r[1], r[2]) for r in rows][::-1]
+
 
 def _load_embeddings_for_user(user_id: int):
     cur = conn.cursor()
@@ -91,6 +111,7 @@ def get_relevant_memories(user_id: int, query_embedding: List[float], top_k: int
             })
     return results
 
+
 def clear_memory(user_id: Optional[int] = None):
     cur = conn.cursor()
     if user_id is None:
@@ -99,3 +120,81 @@ def clear_memory(user_id: Optional[int] = None):
         cur.execute('DELETE FROM messages WHERE user_id = ?', (user_id,))
     conn.commit()
 
+
+# Settings helpers
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    cur = conn.cursor()
+    cur.execute('SELECT value FROM settings WHERE key = ?', (key,))
+    row = cur.fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    cur = conn.cursor()
+    cur.execute('REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
+    conn.commit()
+
+
+# Admin management
+def add_admin(user_id: int) -> bool:
+    cur = conn.cursor()
+    try:
+        cur.execute('INSERT OR REPLACE INTO admins (user_id, added_at) VALUES (?, ?)', (user_id, _now_iso()))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def remove_admin(user_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
+    changed = cur.rowcount
+    conn.commit()
+    return changed > 0
+
+
+def list_admins() -> List[int]:
+    cur = conn.cursor()
+    cur.execute('SELECT user_id FROM admins')
+    rows = cur.fetchall()
+    return [r[0] for r in rows]
+
+
+def is_admin(user_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM admins WHERE user_id = ? LIMIT 1', (user_id,))
+    return cur.fetchone() is not None
+
+
+# Ban management
+def add_ban(user_id: int, reason: Optional[str] = None) -> bool:
+    cur = conn.cursor()
+    try:
+        cur.execute('INSERT OR REPLACE INTO bans (user_id, reason, created_at) VALUES (?, ?, ?)', (user_id, reason or '', _now_iso()))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def remove_ban(user_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute('DELETE FROM bans WHERE user_id = ?', (user_id,))
+    changed = cur.rowcount
+    conn.commit()
+    return changed > 0
+
+
+def is_banned(user_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute('SELECT reason, created_at FROM bans WHERE user_id = ? LIMIT 1', (user_id,))
+    row = cur.fetchone()
+    return row is not None
+
+
+def list_bans() -> List[Tuple[int, str, str]]:
+    cur = conn.cursor()
+    cur.execute('SELECT user_id, reason, created_at FROM bans')
+    rows = cur.fetchall()
+    return [(r[0], r[1], r[2]) for r in rows]
