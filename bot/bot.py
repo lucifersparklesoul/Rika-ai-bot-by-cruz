@@ -41,6 +41,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ban <user_id> [reason] - (admin) ban a user\n"
         "/unban <user_id> - (admin) unban a user\n"
         "/banlist - list banned users\n"
+        "/gban <user_id> [reason] - (admin) global ban a user (removes admin)\n"
+        "/ungban <user_id> - (admin) remove global ban\n"
+        "/gbanlist - list global bans\n"
         "/banall - (admin) block all non-admin users from using the bot\n"
         "/unbanall - (admin) disable ban-all mode\n"
     )
@@ -213,7 +216,63 @@ async def banlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bans:
         await update.message.reply_text("No banned users.")
         return
-    lines = [f"{u} - {reason} ({ts})" for (u, reason, ts) in bans]
+    # list_bans returns tuples (user_id, reason, created_at, is_global)
+    lines = [f"{u} - {reason} ({ts}){' [GLOBAL]' if isg else ''}" for (u, reason, ts, isg) in bans]
+    await update.message.reply_text('\n'.join(lines))
+
+
+async def gban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not is_caller_admin(caller.id):
+        await update.message.reply_text("You are not authorized to global-ban users.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /gban <user_id> [reason]")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user id. Use numeric Telegram user id.")
+        return
+    reason = ' '.join(context.args[1:]) if len(context.args) > 1 else ''
+    ok = db.add_global_ban(target_id, reason)
+    if ok:
+        await update.message.reply_text(f"Globally banned {target_id}. Reason: {reason}")
+    else:
+        await update.message.reply_text("Failed to global-ban user.")
+
+
+async def ungban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not is_caller_admin(caller.id):
+        await update.message.reply_text("You are not authorized to remove global bans.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /ungban <user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user id. Use numeric Telegram user id.")
+        return
+    ok = db.remove_global_ban(target_id)
+    if ok:
+        await update.message.reply_text(f"Removed global ban for {target_id}.")
+    else:
+        await update.message.reply_text("Failed to remove global ban or user was not globally banned.")
+
+
+async def gbanlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caller = update.effective_user
+    if not is_caller_admin(caller.id):
+        await update.message.reply_text("You are not authorized to view the global ban list.")
+        return
+    bans = db.list_bans()
+    global_bans = [b for b in bans if b[3] == 1]
+    if not global_bans:
+        await update.message.reply_text("No global bans.")
+        return
+    lines = [f"{u} - {reason} ({ts})" for (u, reason, ts, isg) in global_bans]
     await update.message.reply_text('\n'.join(lines))
 
 
@@ -309,6 +368,9 @@ def main():
     app.add_handler(CommandHandler('ban', ban_cmd))
     app.add_handler(CommandHandler('unban', unban_cmd))
     app.add_handler(CommandHandler('banlist', banlist_cmd))
+    app.add_handler(CommandHandler('gban', gban_cmd))
+    app.add_handler(CommandHandler('ungban', ungban_cmd))
+    app.add_handler(CommandHandler('gbanlist', gbanlist_cmd))
     app.add_handler(CommandHandler('banall', banall_cmd))
     app.add_handler(CommandHandler('unbanall', unbanall_cmd))
 
