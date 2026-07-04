@@ -1,18 +1,13 @@
 import logging
 import asyncio
-from telegram import Update, InputMediaPhoto
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 from .config import settings
-from .db import save_message, get_recent_messages, embed_text, get_relevant_memories, clear_memory
-from .db import save_message as db_save_message
-from .llm import chat_completion, embed_text as llm_embed, generate_image
-from .db import get_relevant_memories as db_get_relevant_memories
-from .db import get_recent_messages as db_get_recent_messages
-from .db import conn
+from . import db
+from . import llm
 
-import json
-import numpy as np
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,34 +38,34 @@ async def setprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /setprompt <text>")
         return
     # save to settings table
-    cur = conn.cursor()
+    cur = db.conn.cursor()
     cur.execute('REPLACE INTO settings (key, value) VALUES (?, ?)', ("system_prompt", new_prompt))
-    conn.commit()
+    db.conn.commit()
     await update.message.reply_text("System prompt updated.")
 
 async def clearmemory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id in ADMIN_IDS and context.args and context.args[0] == 'all':
-        clear_memory(None)
+        db.clear_memory(None)
         await update.message.reply_text("All memories cleared.")
         return
-    clear_memory(user.id)
+    db.clear_memory(user.id)
     await update.message.reply_text("Your memory cleared.")
 
 async def summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    msgs = db_get_recent_messages(user.id, limit=30)
+    msgs = db.get_recent_messages(user.id, limit=30)
     if not msgs:
         await update.message.reply_text("No messages to summarize.")
         return
     combined = '\n'.join([f"{r[1]}: {r[2]}" for r in msgs])
-    system = conn.execute('SELECT value FROM settings WHERE key = ?', ("system_prompt",)).fetchone()
+    system = db.conn.execute('SELECT value FROM settings WHERE key = ?', ("system_prompt",)).fetchone()
     system_prompt = system[0] if system else settings.SYSTEM_PROMPT
     messages = [
         {"role":"system","content": system_prompt},
         {"role":"user","content": "Please provide a short summary of the following conversation:\n" + combined}
     ]
-    resp = await chat_completion(messages)
+    resp = await llm.chat_completion(messages)
     text = resp['choices'][0]['message']['content']
     await update.message.reply_text(text)
 
@@ -81,7 +76,7 @@ async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = ' '.join(context.args)
     await update.message.reply_text("Generating image... This may take a moment.")
     try:
-        url = await generate_image(prompt)
+        url = await llm.generate_image(prompt)
         if url:
             await update.message.reply_photo(photo=url, caption=f"Image generated for: {prompt}")
         else:
@@ -93,38 +88,45 @@ async def image_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
-    await update.message.chat.do_action('typing')
-    # save user message
-    loop = asyncio.get_event_loop()
-    # create embedding
+    # Indicate typing
     try:
-        embedding = await llm_embed(text)
+        await update.message.chat.do_action('typing')
+    except Exception:
+        pass
+
+    # save user message
+    try:
+        embedding = await llm.embed_text(text)
     except Exception:
         embedding = None
-    db_save_message(user.id, 'user', text, embedding)
+    db.save_message(user.id, 'user', text, embedding)
+
     # retrieve relevant memories
     rel = []
     if embedding is not None:
-        rel = db_get_relevant_memories(user.id, embedding, top_k=6, min_score=0.6)
-    system = conn.execute('SELECT value FROM settings WHERE key = ?', ("system_prompt",)).fetchone()
+        rel = db.get_relevant_memories(user.id, embedding, top_k=6, min_score=0.6)
+
+    system = db.conn.execute('SELECT value FROM settings WHERE key = ?', ("system_prompt",)).fetchone()
     system_prompt = system[0] if system else settings.SYSTEM_PROMPT
+
     messages = [{"role":"system","content": system_prompt}]
     # include retrieved memories as context
     for r in rel:
         messages.append({"role":"system","content": f"Relevant memory (score={r['score']:.2f}): {r['content']}"})
     # include recent chat
-    recent = db_get_recent_messages(user.id, limit=8)
+    recent = db.get_recent_messages(user.id, limit=8)
     for _id, role, content in recent:
         messages.append({"role": role, "content": content})
     messages.append({"role":"user","content": text})
+
     try:
-        resp = await chat_completion(messages)
+        resp = await llm.chat_completion(messages)
         reply = resp['choices'][0]['message']['content']
     except Exception as e:
         logger.exception(e)
         reply = "Sorry, I had an error contacting the language model."
     # save assistant message
-    db_save_message(user.id, 'assistant', reply, None)
+    db.save_message(user.id, 'assistant', reply, None)
     await update.message.reply_text(reply)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -140,8 +142,21 @@ def main():
     app.add_handler(CommandHandler('image', image_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-    logger.info("Starting bot...")
-    app.run_polling()
+
+    webhook_url = settings.WEBHOOK_URL
+    token = settings.TELEGRAM_TOKEN
+    port = int(os.environ.get('PORT', settings.PORT))
+
+    if webhook_url:
+        # construct webhook path and full url
+        path = f"/webhook/{token}"
+        full = webhook_url.rstrip('/') + path
+        logger.info(f"Starting in webhook mode on port {port}, webhook={full}")
+        # run webhook server (uses aiohttp internally)
+        app.run_webhook(listen='0.0.0.0', port=port, url_path=path, webhook_url=full)
+    else:
+        logger.info("Starting in polling mode (no WEBHOOK_URL set)")
+        app.run_polling()
 
 if __name__ == '__main__':
     main()

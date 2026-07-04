@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     TEMPERATURE: float = 0.2
     OPENAI_CHAT_MODEL: str = "gpt-3.5-turbo"
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    WEBHOOK_URL: Optional[str] = None
+    PORT: int = 8000
 
     class Config:
         env_file = ".env"
