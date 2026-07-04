@@ -1,0 +1,101 @@
+import sqlite3
+import json
+import os
+from datetime import datetime
+from typing import List, Tuple, Optional
+import numpy as np
+
+from .config import settings
+
+os.makedirs(os.path.dirname(settings.DB_PATH) or '.', exist_ok=True)
+
+def init_db():
+    conn = sqlite3.connect(settings.DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        role TEXT,
+        content TEXT,
+        embedding TEXT,
+        created_at TEXT
+    )
+    ''')
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    ''')
+    conn.commit()
+    return conn
+
+conn = init_db()
+
+def _now_iso():
+    return datetime.utcnow().isoformat() + 'Z'
+
+def save_message(user_id: int, role: str, content: str, embedding: Optional[List[float]] = None):
+    cur = conn.cursor()
+    emb_json = None
+    if embedding is not None:
+        emb_json = json.dumps([float(x) for x in embedding])
+    cur.execute('INSERT INTO messages (user_id, role, content, embedding, created_at) VALUES (?, ?, ?, ?, ?)',
+                (user_id, role, content, emb_json, _now_iso()))
+    conn.commit()
+    return cur.lastrowid
+
+def get_recent_messages(user_id: int, limit: int = 20) -> List[Tuple[int,str,str]]:
+    cur = conn.cursor()
+    cur.execute('SELECT id, role, content FROM messages WHERE user_id = ? ORDER BY id DESC LIMIT ?', (user_id, limit))
+    rows = cur.fetchall()
+    return [(r[0], r[1], r[2]) for r in rows][::-1]
+
+def _load_embeddings_for_user(user_id: int):
+    cur = conn.cursor()
+    cur.execute('SELECT id, content, embedding FROM messages WHERE user_id = ? AND embedding IS NOT NULL', (user_id,))
+    rows = cur.fetchall()
+    ids = []
+    contents = []
+    embs = []
+    for r in rows:
+        ids.append(r[0])
+        contents.append(r[1])
+        embs.append(np.array(json.loads(r[2]), dtype=float))
+    if embs:
+        matrix = np.vstack(embs)
+    else:
+        matrix = np.empty((0,))
+    return ids, contents, matrix
+
+
+def get_relevant_memories(user_id: int, query_embedding: List[float], top_k: int = 5, min_score: float = 0.65):
+    ids, contents, matrix = _load_embeddings_for_user(user_id)
+    if matrix.size == 0:
+        return []
+    query = np.array(query_embedding, dtype=float)
+    # cosine similarity
+    norms = np.linalg.norm(matrix, axis=1) * (np.linalg.norm(query) + 1e-12)
+    dots = matrix.dot(query)
+    scores = dots / (norms + 1e-12)
+    ranked_idx = np.argsort(-scores)
+    results = []
+    for idx in ranked_idx[:top_k]:
+        score = float(scores[idx])
+        if score >= min_score:
+            results.append({
+                'id': ids[idx],
+                'content': contents[idx],
+                'score': score
+            })
+    return results
+
+def clear_memory(user_id: Optional[int] = None):
+    cur = conn.cursor()
+    if user_id is None:
+        cur.execute('DELETE FROM messages')
+    else:
+        cur.execute('DELETE FROM messages WHERE user_id = ?', (user_id,))
+    conn.commit()
+
